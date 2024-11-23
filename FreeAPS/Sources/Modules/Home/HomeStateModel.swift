@@ -10,12 +10,14 @@ extension Home {
         @Injected() var apsManager: APSManager!
         @Injected() var nightscoutManager: NightscoutManager!
         @Injected() var storage: TempTargetsStorage!
+        @Injected() var keychain: Keychain!
         private let timer = DispatchTimer(timeInterval: 5)
         private(set) var filteredHours = 24
         @Published var glucose: [BloodGlucose] = []
         @Published var isManual: [BloodGlucose] = []
         @Published var announcement: [Announcement] = []
         @Published var suggestion: Suggestion?
+        @Published var dynamicVariables: DynamicVariables?
         @Published var uploadStats = false
         @Published var enactedSuggestion: Suggestion?
         @Published var recentGlucose: BloodGlucose?
@@ -73,15 +75,24 @@ extension Home {
         @Published var overrideHistory: [OverrideHistory] = []
         @Published var overrides: [Override] = []
         @Published var alwaysUseColors: Bool = true
-        @Published var timeSettings: Bool = true
         @Published var useCalc: Bool = true
         @Published var minimumSMB: Decimal = 0.3
         @Published var maxBolus: Decimal = 0
         @Published var maxBolusValue: Decimal = 1
         @Published var useInsulinBars: Bool = false
         @Published var iobData: [IOBData] = []
+        @Published var carbData: Decimal = 0
+        @Published var iobs: Decimal = 0
         @Published var neg: Int = 0
         @Published var tddChange: Decimal = 0
+        @Published var tddAverage: Decimal = 0
+        @Published var tddYesterday: Decimal = 0
+        @Published var tdd2DaysAgo: Decimal = 0
+        @Published var tdd3DaysAgo: Decimal = 0
+        @Published var tddActualAverage: Decimal = 0
+        @Published var skipGlucoseChart: Bool = false
+        @Published var displayDelta: Bool = false
+        @Published var openAPSSettings: Preferences?
 
         let coredataContext = CoreDataStack.shared.persistentContainer.viewContext
 
@@ -104,6 +115,7 @@ extension Home {
 
             // iobData = provider.reasons()
             suggestion = provider.suggestion
+            dynamicVariables = provider.dynamicVariables
             overrideHistory = provider.overrideHistory()
             uploadStats = settingsManager.settings.uploadStats
             enactedSuggestion = provider.enactedSuggestion
@@ -127,11 +139,12 @@ extension Home {
             useTargetButton = settingsManager.settings.useTargetButton
             hours = settingsManager.settings.hours
             alwaysUseColors = settingsManager.settings.alwaysUseColors
-            timeSettings = settingsManager.settings.timeSettings
             useCalc = settingsManager.settings.useCalc
             minimumSMB = settingsManager.settings.minimumSMB
             maxBolus = settingsManager.pumpSettings.maxBolus
             useInsulinBars = settingsManager.settings.useInsulinBars
+            skipGlucoseChart = settingsManager.settings.skipGlucoseChart
+            displayDelta = settingsManager.settings.displayDelta
 
             broadcaster.register(GlucoseObserver.self, observer: self)
             broadcaster.register(SuggestionObserver.self, observer: self)
@@ -265,6 +278,10 @@ extension Home {
                         // Update in Nightscout
                         nightscoutManager.editOverride(preset, duration, activeOveride.date ?? Date.now)
                     }
+                } else if activeOveride.isPreset { // Because hard coded Hypo treatment isn't actually a preset
+                    if let duration = os.cancelProfile() {
+                        nightscoutManager.editOverride("📉", duration, activeOveride.date ?? Date.now)
+                    }
                 } else {
                     let nsString = activeOveride.percentage.formatted() != "100" ? activeOveride.percentage
                         .formatted() + " %" : "Custom"
@@ -289,6 +306,23 @@ extension Home {
                 setHBT.date = Date()
                 try? self.coredataContext.save()
             }
+        }
+
+        func fetchPreferences() {
+            let token = Token().getIdentifier()
+            let database = Database(token: token)
+            database.fetchPreferences("default")
+                .receive(on: DispatchQueue.main)
+                .sink { completion in
+                    switch completion {
+                    case .finished:
+                        debug(.service, "Preferences fetched from database. Profile: default")
+                    case let .failure(error):
+                        debug(.service, "Preferences fetched from database failed. Error: " + error.localizedDescription)
+                    }
+                }
+            receiveValue: { self.openAPSSettings = $0 }
+                .store(in: &lifetime)
         }
 
         private func setupGlucose() {
@@ -481,15 +515,29 @@ extension Home {
                 guard let self = self else { return }
                 if let data = self.provider.reasons() {
                     self.iobData = data
+                    self.carbData = data.map(\.cob).reduce(0, +)
+                    self.iobs = data.map(\.iob).reduce(0, +)
                     neg = data.filter({ $0.iob < 0 }).count * 5
-                    let tdds = CoreDataStorage().fetchTDD(interval: DateFilter().twoDays)
+                    let tdds = CoreDataStorage().fetchTDD(interval: DateFilter().tenDays)
                     let yesterday = (tdds.first(where: {
                         ($0.timestamp ?? .distantFuture) <= Date().addingTimeInterval(-24.hours.timeInterval)
                     })?.tdd ?? 0) as Decimal
+                    let oneDaysAgo = CoreDataStorage().fetchTDD(interval: DateFilter().today).last
                     tddChange = ((tdds.first?.tdd ?? 0) as Decimal) - yesterday
+                    tddYesterday = (oneDaysAgo?.tdd ?? 0) as Decimal
+                    tdd2DaysAgo = (tdds.first(where: {
+                        ($0.timestamp ?? .distantFuture) <= (oneDaysAgo?.timestamp ?? .distantPast)
+                            .addingTimeInterval(-1.days.timeInterval)
+                    })?.tdd ?? 0) as Decimal
+                    tdd3DaysAgo = (tdds.first(where: {
+                        ($0.timestamp ?? .distantFuture) <= (oneDaysAgo?.timestamp ?? .distantPast)
+                            .addingTimeInterval(-2.days.timeInterval)
+                    })?.tdd ?? 0) as Decimal
 
-                    print("Yesterday: \(yesterday)")
-                    print("Today: \((tdds.first?.tdd ?? 0) as Decimal)")
+                    if let tdds_ = self.provider.dynamicVariables {
+                        tddAverage = ((tdds.first?.tdd ?? 0) as Decimal) - tdds_.average_total_data
+                        tddActualAverage = tdds_.average_total_data
+                    }
                 }
             }
         }
@@ -565,11 +613,12 @@ extension Home.StateModel:
         useTargetButton = settingsManager.settings.useTargetButton
         hours = settingsManager.settings.hours
         alwaysUseColors = settingsManager.settings.alwaysUseColors
-        timeSettings = settingsManager.settings.timeSettings
         useCalc = settingsManager.settings.useCalc
         minimumSMB = settingsManager.settings.minimumSMB
         maxBolus = settingsManager.pumpSettings.maxBolus
         useInsulinBars = settingsManager.settings.useInsulinBars
+        skipGlucoseChart = settingsManager.settings.skipGlucoseChart
+        displayDelta = settingsManager.settings.displayDelta
         setupGlucose()
         setupOverrideHistory()
         setupData()
